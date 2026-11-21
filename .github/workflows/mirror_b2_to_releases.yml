@@ -4,13 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       vault_id:
-        description: 'Target B2 Vault to mirror (e.g. 08, 09, 10)'
+        description: 'Target B2 Vault (select: all, 08, 09, 10)'
         required: true
-        default: '08'
-      bucket_name:
-        description: 'B2 Bucket Name'
-        required: true
-        default: 'mms-secure-vault-08'
+        default: 'all'
   schedule:
     - cron: '0 3 * * 0' # Every Sunday at 03:00 UTC
 
@@ -28,7 +24,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
 
       - name: Install Dependencies
         run: |
@@ -39,10 +34,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           MMS_MASTER_KEY: ${{ secrets.MMS_MASTER_KEY }}
-          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
-          B2_APP_KEY: ${{ secrets.B2_APP_KEY }}
-          B2_BUCKET_NAME: ${{ github.event.inputs.bucket_name || 'mms-secure-vault-08' }}
-          B2_VAULT_ID: ${{ github.event.inputs.vault_id || '08' }}
-          RELEASE_TAG: vault-${{ github.event.inputs.vault_id || '08' }}-mirror
+          TARGET_VAULT_ID: ${{ github.event.inputs.vault_id || 'all' }}
         run: |
           python b2_to_github_mirror.py

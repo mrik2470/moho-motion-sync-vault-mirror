@@ -1,7 +1,6 @@
 """
-Moho Motion Sync - Cloud-to-Cloud Backblaze B2 to GitHub Releases Mirror Pipeline
-Runs in GitHub Actions or Google Colab (Zero local PC bandwidth).
-Downloads raw assets from B2, encrypts in-memory with AES-256-GCM, and publishes to GitHub Releases.
+Moho Motion Sync - Multi-Vault Backblaze B2 to Encrypted GitHub Mirror
+Automatically mirrors Vault 08, 09, 10 into AES-256-GCM encrypted GitHub Releases.
 """
 
 import os
@@ -15,7 +14,6 @@ import hashlib
 import urllib.request
 import urllib.error
 import urllib.parse
-from pathlib import Path
 from typing import Dict, List, Any, Optional
 
 try:
@@ -26,6 +24,24 @@ except ImportError:
 
 MAGIC_HEADER = b"MMSX"
 FORMAT_VERSION = 1
+
+KNOWN_VAULTS = {
+    "08": {
+        "bucket": "mms-secure-vault-08",
+        "key_id": "005e967577c6b2d0000000001",
+        "app_key": "K005i6QZX53CU4XtfvL2oaD/CcwYzzE"
+    },
+    "09": {
+        "bucket": "mms-secure-vault-09",
+        "key_id": "005f3f8afaf36cb0000000001",
+        "app_key": "K005W6kTXe4glRD/H8YnHYl8gA+ISCc"
+    },
+    "10": {
+        "bucket": "mms-secure-vault-10",
+        "key_id": "0056a17e6a16c5b0000000001",
+        "app_key": "K005QdoRzRnY0hqBwjLgTmUOQAj6bHQ"
+    }
+}
 
 def b2_authorize(key_id: str, app_key: str) -> Dict[str, Any]:
     import base64
@@ -59,7 +75,7 @@ def b2_list_all_files(api_url: str, auth_token: str, bucket_id: str) -> List[Dic
     return files
 
 def b2_download_file(download_url: str, auth_token: str, bucket_name: str, file_name: str) -> bytes:
-    encoded_name = urllib.parse.quote(file_name)
+    encoded_name = "/".join(urllib.parse.quote(part) for part in file_name.split("/"))
     url = f"{download_url}/file/{bucket_name}/{encoded_name}"
     req = urllib.request.Request(url, headers={"Authorization": auth_token})
     with urllib.request.urlopen(req, timeout=120) as resp:
@@ -112,89 +128,68 @@ def get_or_create_release(repo: str, token: str, tag: str, title: str) -> Dict[s
         raise
 
 def upload_release_asset(upload_url_template: str, token: str, asset_name: str, payload_bytes: bytes) -> str:
-    # upload_url_template is like "https://uploads.github.com/repos/owner/repo/releases/123/assets{?name,label}"
     base_upload_url = upload_url_template.split("{")[0]
     upload_url = f"{base_upload_url}?name={urllib.parse.quote(asset_name)}"
     res = gh_api_request(upload_url, token, method="POST", data=payload_bytes, content_type="application/octet-stream")
     return res.get("browser_download_url", "")
 
 def sanitize_asset_name(remote_path: str) -> str:
-    # GitHub release asset names cannot have slashes or backslashes
     safe = remote_path.replace("/", "_").replace("\\", "_").replace(" ", "_")
     return f"{safe}.bin"
 
-def main():
+def process_vault(vid: str, vinfo: Dict[str, str], gh_repo: str, gh_token: str, master_key_bytes: bytes):
+    b2_bucket_name = vinfo["bucket"]
+    release_tag = f"vault-{vid}-mirror"
+    print("\n" + "=" * 70)
+    print(f"[*] Processing Vault {vid} ({b2_bucket_name}) -> Release: {release_tag}")
     print("=" * 70)
-    print("   MOHO MOTION SYNC - B2 TO GITHUB RELEASES MIRROR PIPELINE   ")
-    print("=" * 70)
-
-    # Config from Environment
-    b2_key_id = os.environ.get("B2_KEY_ID")
-    b2_app_key = os.environ.get("B2_APP_KEY")
-    b2_bucket_name = os.environ.get("B2_BUCKET_NAME", "mms-secure-vault-08")
-    b2_vault_id = os.environ.get("B2_VAULT_ID", "08")
-    gh_repo = os.environ.get("GITHUB_REPOSITORY") # "owner/repo" in GitHub Actions
-    gh_token = os.environ.get("GITHUB_TOKEN")
-    master_key_hex = os.environ.get("MMS_MASTER_KEY")
-    release_tag = os.environ.get("RELEASE_TAG", f"vault-{b2_vault_id}-mirror")
-
-    if not all([b2_key_id, b2_app_key, gh_repo, gh_token, master_key_hex]):
-        print("[!] Error: Missing required environment variables:")
-        print("    B2_KEY_ID, B2_APP_KEY, GITHUB_REPOSITORY, GITHUB_TOKEN, MMS_MASTER_KEY")
-        sys.exit(1)
-
-    master_key_bytes = bytes.fromhex(master_key_hex.strip())
-    if len(master_key_bytes) != 32:
-        print("[!] Master key must be exactly 32 bytes (64 hex chars).")
-        sys.exit(1)
-
-    print(f"[*] Target GitHub Repo : {gh_repo}")
-    print(f"[*] Release Tag        : {release_tag}")
-    print(f"[*] Source B2 Bucket   : {b2_bucket_name}")
 
     # 1. Authorize B2
-    print("[*] Connecting to Backblaze B2...")
-    b2_auth = b2_authorize(b2_key_id, b2_app_key)
+    b2_auth = b2_authorize(vinfo["key_id"], vinfo["app_key"])
     api_url = b2_auth["apiUrl"]
     download_url = b2_auth["downloadUrl"]
     auth_token = b2_auth["authorizationToken"]
 
-    # Find bucket ID
-    b_id = None
-    req_b = urllib.request.Request(
-        f"{api_url}/b2api/v2/b2_list_buckets",
-        data=json.dumps({"accountId": b2_auth["accountId"]}).encode("utf-8"),
-        headers={"Authorization": auth_token, "Content-Type": "application/json"}
-    )
-    with urllib.request.urlopen(req_b, timeout=30) as resp:
-        b_list = json.loads(resp.read().decode("utf-8")).get("buckets", [])
-        for b in b_list:
-            if b["bucketName"] == b2_bucket_name:
-                b_id = b["bucketId"]
-                break
+    # Retrieve bucketId directly from allowed key scope
+    bucket_id = b2_auth.get("allowed", {}).get("bucketId")
+    if not bucket_id:
+        # Fallback query list_buckets if unrestricted
+        try:
+            req_b = urllib.request.Request(
+                f"{api_url}/b2api/v2/b2_list_buckets",
+                data=json.dumps({"accountId": b2_auth["accountId"]}).encode("utf-8"),
+                headers={"Authorization": auth_token, "Content-Type": "application/json"}
+            )
+            with urllib.request.urlopen(req_b, timeout=30) as resp:
+                b_list = json.loads(resp.read().decode("utf-8")).get("buckets", [])
+                for b in b_list:
+                    if b["bucketName"] == b2_bucket_name:
+                        bucket_id = b["bucketId"]
+                        break
+        except Exception:
+            pass
 
-    if not b_id:
-        print(f"[!] Bucket {b2_bucket_name} not found in B2 account.")
-        sys.exit(1)
+    if not bucket_id:
+        print(f"[!] Could not determine bucketId for {b2_bucket_name}. Skipping vault.")
+        return
 
-    # 2. List all files in B2
-    print(f"[*] Listing all assets in {b2_bucket_name}...")
-    files = b2_list_all_files(api_url, auth_token, b_id)
-    print(f"[+] Total files discovered in B2: {len(files)}")
+    # 2. List all files
+    print(f"[*] Listing all files from bucketId: {bucket_id}...")
+    files = b2_list_all_files(api_url, auth_token, bucket_id)
+    print(f"[+] Total files in Vault {vid}: {len(files)}")
 
     # 3. Setup Release on GitHub
-    print(f"[*] Checking GitHub Release: {release_tag}...")
-    release_info = get_or_create_release(gh_repo, gh_token, release_tag, f"Vault {b2_vault_id} Encrypted Mirror")
+    release_info = get_or_create_release(gh_repo, gh_token, release_tag, f"Vault {vid} Encrypted Mirror")
     upload_url_tmpl = release_info["upload_url"]
 
-    # Check existing release assets
+    # Check already mirrored assets
     existing_assets = {a["name"]: a["browser_download_url"] for a in release_info.get("assets", [])}
-    print(f"[*] Existing release assets already mirrored: {len(existing_assets)}")
+    print(f"[*] Already mirrored in release: {len(existing_assets)}")
 
     manifest = {}
-    uploaded_count = 0
-    skipped_count = 0
-    error_count = 0
+    uploaded = 0
+    skipped = 0
+    errors = 0
 
     for idx, f in enumerate(files, 1):
         fname = f["fileName"]
@@ -206,44 +201,77 @@ def main():
                 "download_url": existing_assets[asset_name],
                 "size": f.get("contentLength", 0)
             }
-            skipped_count += 1
+            skipped += 1
             continue
 
-        print(f"[{idx}/{len(files)}] Mirroring {fname} -> {asset_name}...")
+        print(f"[{idx}/{len(files)}] Vault {vid}: {fname} -> {asset_name}...")
         try:
-            # Download from B2
             raw_bytes = b2_download_file(download_url, auth_token, b2_bucket_name, fname)
-
-            # Encrypt with Master Key
             encrypted_bin = encrypt_payload(raw_bytes, fname, master_key_bytes)
-
-            # Upload to GitHub Release
             dl_url = upload_release_asset(upload_url_tmpl, gh_token, asset_name, encrypted_bin)
             manifest[fname] = {
                 "bin_name": asset_name,
                 "download_url": dl_url,
                 "size": len(raw_bytes)
             }
-            uploaded_count += 1
-            print(f"    [+] Uploaded to GitHub CDN: {dl_url}")
+            uploaded += 1
+            print(f"    [+] Mirrored OK: {dl_url}")
+        except Exception as e:
+            print(f"    [!] Mirror failed for {fname}: {e}")
+            errors += 1
 
-        except Exception as err:
-            print(f"    [!] Failed to mirror {fname}: {err}")
-            error_count += 1
-
-    # 4. Upload manifest to release
-    print("[*] Generating and uploading vault mirror manifest...")
+    # Upload manifest
     manifest_bytes = json.dumps(manifest, indent=2).encode("utf-8")
-    manifest_enc = encrypt_payload(manifest_bytes, f"manifest_{release_tag}.json", master_key_bytes)
-    
-    # Also save plaintext manifest for fast API routing if desired
     try:
-        upload_release_asset(upload_url_tmpl, gh_token, "vault_mirror_manifest.json", manifest_bytes)
+        upload_release_asset(upload_url_tmpl, gh_token, f"vault_{vid}_mirror_manifest.json", manifest_bytes)
     except Exception:
         pass
 
+    print(f"[+] Vault {vid} Complete: Total: {len(files)} | Uploaded: {uploaded} | Skipped: {skipped} | Errors: {errors}")
+
+def main():
+    print("=" * 70)
+    print("   MOHO MOTION SYNC - MULTI-VAULT B2 TO GITHUB MIRROR PIPELINE   ")
+    print("=" * 70)
+
+    gh_repo = os.environ.get("GITHUB_REPOSITORY")
+    gh_token = os.environ.get("GITHUB_TOKEN")
+    master_key_hex = os.environ.get("MMS_MASTER_KEY")
+    target_vault = os.environ.get("TARGET_VAULT_ID", "all").strip().lower()
+
+    if not all([gh_repo, gh_token, master_key_hex]):
+        print("[!] Error: Missing required environment variables (GITHUB_REPOSITORY, GITHUB_TOKEN, MMS_MASTER_KEY)")
+        sys.exit(1)
+
+    master_key_bytes = bytes.fromhex(master_key_hex.strip())
+    if len(master_key_bytes) != 32:
+        print("[!] Master key must be exactly 32 bytes (64 hex chars).")
+        sys.exit(1)
+
+    # Determine which vaults to process
+    if target_vault in ["all", ""]:
+        vaults_to_run = list(KNOWN_VAULTS.keys())
+    elif target_vault in KNOWN_VAULTS:
+        vaults_to_run = [target_vault]
+    else:
+        # Check if custom credentials passed via environment
+        env_b2_id = os.environ.get("B2_KEY_ID")
+        env_b2_key = os.environ.get("B2_APP_KEY")
+        env_bucket = os.environ.get("B2_BUCKET_NAME", f"mms-secure-vault-{target_vault}")
+        if env_b2_id and env_b2_key:
+            KNOWN_VAULTS[target_vault] = {"bucket": env_bucket, "key_id": env_b2_id, "app_key": env_b2_key}
+            vaults_to_run = [target_vault]
+        else:
+            print(f"[!] Unknown target vault '{target_vault}'. Available: {list(KNOWN_VAULTS.keys())} or 'all'")
+            sys.exit(1)
+
+    print(f"[*] Repositories to mirror: {vaults_to_run}")
+
+    for vid in sorted(vaults_to_run):
+        process_vault(vid, KNOWN_VAULTS[vid], gh_repo, gh_token, master_key_bytes)
+
     print("\n" + "=" * 70)
-    print(f"MIRROR SUMMARY: Discovered: {len(files)} | Uploaded: {uploaded_count} | Skipped: {skipped_count} | Errors: {error_count}")
+    print("[+] ALL VAULTS PROCESSED SUCCESSFULLY.")
     print("=" * 70)
 
 if __name__ == "__main__":
