@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       vault_id:
-        description: 'Target B2 Vault (select: all, 08, 09, 10)'
+        description: 'Target B2 Vault (select: all, 01, 02, 03, 04, 05, 06, 07, 08, 09, 10)'
         required: true
         default: 'all'
   schedule:

@@ -26,6 +26,41 @@ MAGIC_HEADER = b"MMSX"
 FORMAT_VERSION = 1
 
 KNOWN_VAULTS = {
+    "01": {
+        "bucket": "mms-secure-vault-01",
+        "key_id": "005bf0bf426cb820000000001",
+        "app_key": "K005Nzcw0sWUXgwvN2uAtX86PzNveSw"
+    },
+    "02": {
+        "bucket": "mms-secure-vault-02",
+        "key_id": "005662c67e5d84d0000000001",
+        "app_key": "K005wqZQEMLweYWFKzJ+Qx+vjaFPvHY"
+    },
+    "03": {
+        "bucket": "mms-secure-vault-03",
+        "key_id": "005868f228a70cb0000000001",
+        "app_key": "K005G0wpB9JgNxpc9sLw0FeihGUpGsU"
+    },
+    "04": {
+        "bucket": "mms-secure-vault-04",
+        "key_id": "005cba5ae79f02b0000000001",
+        "app_key": "K0059ompgIVdDg7gTjRKo4sZvQT+m4A"
+    },
+    "05": {
+        "bucket": "mms-secure-vault-05",
+        "key_id": "0053275942c61440000000001",
+        "app_key": "K005rtHbvjzOWc8mmQZrAzT4JYfoZPM"
+    },
+    "06": {
+        "bucket": "mms-secure-vault-06",
+        "key_id": "00514e0dabdf9060000000001",
+        "app_key": "K005ORdbGQU6Ih5nIyLEOP3mXiEtbOo"
+    },
+    "07": {
+        "bucket": "mms-secure-vault-07",
+        "key_id": "005668547722b400000000001",
+        "app_key": "K005Rloxwnfwew2TY03qfZHZCJpkj4I"
+    },
     "08": {
         "bucket": "mms-secure-vault-08",
         "key_id": "005e967577c6b2d0000000001",
