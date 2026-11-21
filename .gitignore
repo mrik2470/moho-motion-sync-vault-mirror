@@ -1,0 +1,13 @@
+# Security: NEVER push master key guide or keys to GitHub
+BITWARDEN_MASTER_KEY_AND_SETUP_GUIDE.md
+*.key
+*.hex
+
+# Python caches and bins
+__pycache__/
+*.pyc
+*.bin
+*.log
+*.tmp
+.DS_Store
+Thumbs.db

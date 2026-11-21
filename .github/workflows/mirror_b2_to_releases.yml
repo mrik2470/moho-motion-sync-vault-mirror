@@ -1,0 +1,48 @@
+name: Backblaze B2 to Encrypted GitHub Mirror
+
+on:
+  workflow_dispatch:
+    inputs:
+      vault_id:
+        description: 'Target B2 Vault to mirror (e.g. 08, 09, 10)'
+        required: true
+        default: '08'
+      bucket_name:
+        description: 'B2 Bucket Name'
+        required: true
+        default: 'mms-secure-vault-08'
+  schedule:
+    - cron: '0 3 * * 0' # Every Sunday at 03:00 UTC
+
+permissions:
+  contents: write
+
+jobs:
+  mirror-assets:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          pip install cryptography
+
+      - name: Run Cloud-to-Cloud Mirror Pipeline
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          MMS_MASTER_KEY: ${{ secrets.MMS_MASTER_KEY }}
+          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+          B2_APP_KEY: ${{ secrets.B2_APP_KEY }}
+          B2_BUCKET_NAME: ${{ github.event.inputs.bucket_name || 'mms-secure-vault-08' }}
+          B2_VAULT_ID: ${{ github.event.inputs.vault_id || '08' }}
+          RELEASE_TAG: vault-${{ github.event.inputs.vault_id || '08' }}-mirror
+        run: |
+          python b2_to_github_mirror.py
