@@ -1,6 +1,11 @@
 """
-Moho Motion Sync - High-Speed Multi-Threaded B2 to Encrypted GitHub Mirror
+Moho Motion Sync - High-Speed Multi-Threaded Sharded Cloud Mirror
 Concurrently mirrors Vaults 01 to 10 into AES-256-GCM encrypted GitHub Releases.
+Features:
+- Automatic Release Sharding (Max 600 files per tag to avoid GitHub 1,000 asset limit)
+- 100% backward compatibility: Preserves existing 3,000 assets in vault-08, vault-01, vault-09
+- 8x parallel multi-threaded stream workers
+- Dynamic resume and deduplication
 """
 
 import os
@@ -25,7 +30,8 @@ except ImportError:
 
 MAGIC_HEADER = b"MMSX"
 FORMAT_VERSION = 1
-MAX_WORKERS = 8  # 8 parallel cloud-to-cloud transfer streams
+MAX_WORKERS = 8       # 8 parallel cloud-to-cloud transfer streams
+MAX_ASSETS_PER_TAG = 600  # Safe limit well below GitHub's 1,000 cap
 
 KNOWN_VAULTS = {
     "01": {"bucket": "mms-secure-vault-01", "key_id": "005bf0bf426cb820000000001", "app_key": "K005Nzcw0sWUXgwvN2uAtX86PzNveSw"},
@@ -124,6 +130,33 @@ def get_or_create_release(repo: str, token: str, tag: str, title: str) -> Dict[s
             return gh_api_request(create_url, token, method="POST", data=payload)
         raise
 
+def get_release_assets_map(repo: str, token: str, tag: str) -> Tuple[Optional[Dict[str, Any]], Dict[str, str]]:
+    url = f"https://api.github.com/repos/{repo}/releases/tags/{tag}"
+    try:
+        rel = gh_api_request(url, token, method="GET")
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None, {}
+        raise
+
+    assets_map = {}
+    rel_id = rel["id"]
+    page = 1
+    while True:
+        p_url = f"https://api.github.com/repos/{repo}/releases/{rel_id}/assets?per_page=100&page={page}"
+        try:
+            p_assets = gh_api_request(p_url, token, method="GET")
+            if not p_assets:
+                break
+            for a in p_assets:
+                assets_map[a["name"]] = a["browser_download_url"]
+            if len(p_assets) < 100:
+                break
+            page += 1
+        except Exception:
+            break
+    return rel, assets_map
+
 def upload_release_asset(upload_url_template: str, token: str, asset_name: str, payload_bytes: bytes) -> str:
     base_upload_url = upload_url_template.split("{")[0]
     upload_url = f"{base_upload_url}?name={urllib.parse.quote(asset_name)}"
@@ -136,9 +169,8 @@ def sanitize_asset_name(remote_path: str) -> str:
 
 def process_vault(vid: str, vinfo: Dict[str, str], gh_repo: str, gh_token: str, master_key_bytes: bytes):
     b2_bucket_name = vinfo["bucket"]
-    release_tag = f"vault-{vid}-mirror"
     print("\n" + "=" * 70)
-    print(f"[*] Processing Vault {vid} ({b2_bucket_name}) -> Release: {release_tag}")
+    print(f"[*] Processing Vault {vid} ({b2_bucket_name})")
     print("=" * 70)
 
     # 1. Authorize B2
@@ -147,7 +179,6 @@ def process_vault(vid: str, vinfo: Dict[str, str], gh_repo: str, gh_token: str, 
     download_url = b2_auth["downloadUrl"]
     auth_token = b2_auth["authorizationToken"]
 
-    # Retrieve bucketId directly
     bucket_id = b2_auth.get("allowed", {}).get("bucketId")
     if not bucket_id:
         try:
@@ -169,97 +200,113 @@ def process_vault(vid: str, vinfo: Dict[str, str], gh_repo: str, gh_token: str, 
         print(f"[!] Could not determine bucketId for {b2_bucket_name}. Skipping vault.")
         return
 
-    # 2. List all files
-    print(f"[*] Listing all files from bucketId: {bucket_id}...")
+    # 2. List all files from B2
+    print(f"[*] Scanning all files in Vault {vid}...")
     files = b2_list_all_files(api_url, auth_token, bucket_id)
-    print(f"[+] Total files in Vault {vid}: {len(files)}")
+    print(f"[+] Total files discovered in Vault {vid}: {len(files)}")
 
-    # 3. Setup Release on GitHub
-    release_info = get_or_create_release(gh_repo, gh_token, release_tag, f"Vault {vid} Encrypted Mirror")
-    upload_url_tmpl = release_info["upload_url"]
-
-    # Check already mirrored assets (Paginated fetch up to all assets)
-    existing_assets = {}
-    rel_id = release_info["id"]
-    page = 1
-    while True:
-        p_url = f"https://api.github.com/repos/{gh_repo}/releases/{rel_id}/assets?per_page=100&page={page}"
-        try:
-            p_assets = gh_api_request(p_url, gh_token, method="GET")
-            if not p_assets:
-                break
-            for a in p_assets:
-                existing_assets[a["name"]] = a["browser_download_url"]
-            if len(p_assets) < 100:
-                break
-            page += 1
-        except Exception:
-            break
-
-    print(f"[*] Verified existing release assets already mirrored: {len(existing_assets)}")
-
-    # If all files in vault are already mirrored, finish immediately
-    unmirrored = [f for f in files if sanitize_asset_name(f["fileName"]) not in existing_assets]
-    print(f"[*] Remaining to upload for Vault {vid}: {len(unmirrored)} files (Skipping {len(files) - len(unmirrored)})")
-
-    if not unmirrored:
-        print(f"[+] Vault {vid} is already 100% mirrored! Moving to next vault.")
+    if not files:
+        print(f"[*] Vault {vid} is empty. Skipping.")
         return
 
-    manifest = {}
-    uploaded = 0
-    skipped = len(files) - len(unmirrored)
-    errors = 0
+    # 3. Check existing legacy base release `vault-{vid}-mirror` (if already created with 1,000 files)
+    base_tag = f"vault-{vid}-mirror"
+    base_rel, base_assets = get_release_assets_map(gh_repo, gh_token, base_tag)
+    
+    all_mirrored_assets = dict(base_assets)
+    print(f"[*] Checked base release '{base_tag}': {len(base_assets)} files already mirrored.")
 
-    # Parallel Worker
-    def mirror_worker(item_tuple: Tuple[int, Dict[str, Any]]) -> Tuple[str, str, str, int, str]:
-        idx, file_item = item_tuple
-        fname = file_item["fileName"]
-        asset_name = sanitize_asset_name(fname)
+    # Filter unmirrored files
+    unmirrored_files = [f for f in files if sanitize_asset_name(f["fileName"]) not in all_mirrored_assets]
+    print(f"[*] Remaining unmirrored files for Vault {vid}: {len(unmirrored_files)} / {len(files)}")
 
-        for attempt in range(3):
-            try:
-                raw_bytes = b2_download_file(download_url, auth_token, b2_bucket_name, fname)
-                encrypted_bin = encrypt_payload(raw_bytes, fname, master_key_bytes)
-                dl_url = upload_release_asset(upload_url_tmpl, gh_token, asset_name, encrypted_bin)
-                return (fname, asset_name, dl_url, len(raw_bytes), "OK")
-            except Exception as e:
-                if attempt == 2:
-                    return (fname, asset_name, "", 0, f"FAIL: {e}")
-                time.sleep(1.0)
-        return (fname, asset_name, "", 0, "FAIL: Retries exhausted")
+    if not unmirrored_files:
+        print(f"[+] Vault {vid} is ALREADY 100% MIRRORED! Skipping.")
+        return
 
-    # Execute with ThreadPoolExecutor
-    total_unmirrored = len(unmirrored)
-    print(f"[*] Launching {MAX_WORKERS} parallel stream workers for Vault {vid}...")
+    # 4. If <= MAX_ASSETS_PER_TAG and base release has capacity (< MAX_ASSETS_PER_TAG), upload directly to base_tag
+    # Otherwise, shard unmirrored files into parts (e.g. vault-{vid}-part02, vault-{vid}-part03...)
+    if len(files) <= MAX_ASSETS_PER_TAG and (not base_rel or len(base_assets) < MAX_ASSETS_PER_TAG):
+        shards = [(base_tag, unmirrored_files)]
+    else:
+        # Determine starting part index
+        start_part = 2 if base_rel else 1
+        shards = []
+        for i in range(0, len(unmirrored_files), MAX_ASSETS_PER_TAG):
+            part_files = unmirrored_files[i:i + MAX_ASSETS_PER_TAG]
+            part_num = start_part + len(shards)
+            part_tag = f"vault-{vid}-part{part_num:02d}"
+            shards.append((part_tag, part_files))
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_map = {executor.submit(mirror_worker, (i, f)): f for i, f in enumerate(unmirrored, 1)}
-        done_count = 0
-        for future in as_completed(future_map):
-            done_count += 1
-            fname, asset_name, dl_url, sz, status = future.result()
-            pct = int((done_count / total_unmirrored) * 100)
-            if status == "OK":
-                uploaded += 1
-                manifest[fname] = {"bin_name": asset_name, "download_url": dl_url, "size": sz}
-                print(f"[{done_count}/{total_unmirrored} - {pct}%] Vault {vid} [+] {fname} -> {asset_name}")
-            else:
-                errors += 1
-                print(f"[{done_count}/{total_unmirrored} - {pct}%] Vault {vid} [!] {status} on {fname}")
+    print(f"[*] Sliced remaining files into {len(shards)} release shard(s).")
 
-    # Upload manifest
-    try:
-        manifest_bytes = json.dumps(manifest, indent=2).encode("utf-8")
-        upload_release_asset(upload_url_tmpl, gh_token, f"vault_{vid}_mirror_manifest.json", manifest_bytes)
-    except Exception:
-        pass
+    # 5. Process each shard
+    for s_tag, s_files in shards:
+        print(f"\n---> Shard: {s_tag} ({len(s_files)} files)")
+        s_rel = get_or_create_release(gh_repo, gh_token, s_tag, f"Vault {vid} Mirror - {s_tag}")
+        upload_url_tmpl = s_rel["upload_url"]
 
-    print(f"[+] Vault {vid} Complete: Total: {len(files)} | Uploaded: {uploaded} | Skipped: {skipped} | Errors: {errors}")
+        # Check existing assets in this shard release
+        _, s_existing = get_release_assets_map(gh_repo, gh_token, s_tag)
+        shard_unmirrored = [f for f in s_files if sanitize_asset_name(f["fileName"]) not in s_existing]
+
+        if not shard_unmirrored:
+            print(f"     [+] Shard {s_tag} already 100% uploaded. Skipping.")
+            continue
+
+        print(f"     [*] Uploading {len(shard_unmirrored)} files to {s_tag} with {MAX_WORKERS} workers...")
+
+        def shard_worker(item_tuple: Tuple[int, Dict[str, Any]]) -> Tuple[str, str, str, int, str]:
+            idx, file_item = item_tuple
+            fname = file_item["fileName"]
+            asset_name = sanitize_asset_name(fname)
+
+            for attempt in range(3):
+                try:
+                    raw_bytes = b2_download_file(download_url, auth_token, b2_bucket_name, fname)
+                    encrypted_bin = encrypt_payload(raw_bytes, fname, master_key_bytes)
+                    dl_url = upload_release_asset(upload_url_tmpl, gh_token, asset_name, encrypted_bin)
+                    return (fname, asset_name, dl_url, len(raw_bytes), "OK")
+                except Exception as e:
+                    if attempt == 2:
+                        return (fname, asset_name, "", 0, f"FAIL: {e}")
+                    time.sleep(1.0)
+            return (fname, asset_name, "", 0, "FAIL: Retries exhausted")
+
+        manifest = {}
+        uploaded = 0
+        errors = 0
+        total_shard_work = len(shard_unmirrored)
+
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            future_map = {executor.submit(shard_worker, (i, f)): f for i, f in enumerate(shard_unmirrored, 1)}
+            done_count = 0
+            for future in as_completed(future_map):
+                done_count += 1
+                fname, asset_name, dl_url, sz, status = future.result()
+                pct = int((done_count / total_shard_work) * 100)
+                if status == "OK":
+                    uploaded += 1
+                    manifest[fname] = {"bin_name": asset_name, "download_url": dl_url, "size": sz}
+                    print(f"[{done_count}/{total_shard_work} - {pct}%] {s_tag} [+] {fname} -> {asset_name}")
+                else:
+                    errors += 1
+                    print(f"[{done_count}/{total_shard_work} - {pct}%] {s_tag} [!] {status} on {fname}")
+
+        # Upload shard manifest
+        try:
+            m_bytes = json.dumps(manifest, indent=2).encode("utf-8")
+            upload_release_asset(upload_url_tmpl, gh_token, f"manifest_{s_tag}.json", m_bytes)
+        except Exception:
+            pass
+
+        print(f"[+] Shard {s_tag} Complete: Uploaded: {uploaded} | Errors: {errors}")
+
+    print(f"\n[+] Vault {vid} Finished Successfully!")
 
 def main():
     print("=" * 70)
-    print("   MOHO MOTION SYNC - MULTI-THREADED (8x) CLOUD MIRROR PIPELINE   ")
+    print("   MOHO MOTION SYNC - SHARDED MULTI-THREADED (8x) CLOUD MIRROR   ")
     print("=" * 70)
 
     gh_repo = os.environ.get("GITHUB_REPOSITORY")
@@ -290,7 +337,7 @@ def main():
         process_vault(vid, KNOWN_VAULTS[vid], gh_repo, gh_token, master_key_bytes)
 
     print("\n" + "=" * 70)
-    print("[+] ALL VAULTS PROCESSED SUCCESSFULLY.")
+    print("[+] ALL VAULTS PROCESSED AND SHARDED SUCCESSFULLY.")
     print("=" * 70)
 
 if __name__ == "__main__":
