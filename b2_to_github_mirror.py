@@ -1,11 +1,9 @@
 """
-Moho Motion Sync - High-Speed Multi-Threaded Sharded Cloud Mirror (v2.1)
-Concurrently mirrors Vaults 01 to 10 into AES-256-GCM encrypted GitHub Releases.
+Moho Motion Sync - High-Speed Multi-Threaded Sharded Cloud Mirror (v2.2)
 Features:
-- Dual-Engine Release Creation: GitHub CLI (gh) + REST API with target_commitish: main
-- Robust error diagnostics & rate-limit backoff handling
+- Smart Rate-Limit Auto-Sleep: When GitHub's 5,000 requests/hr quota is reached, pauses and auto-resumes after reset.
 - Automatic Release Sharding (Max 600 files per tag)
-- 100% backward compatibility: Preserves existing 3,000 assets in vault-08, vault-01, vault-09
+- 100% backward compatibility: Preserves existing ~8,000 assets
 - 8x parallel multi-threaded stream workers
 - Dynamic resume and deduplication
 """
@@ -33,7 +31,7 @@ except ImportError:
 
 MAGIC_HEADER = b"MMSX"
 FORMAT_VERSION = 1
-MAX_WORKERS = 8       # 8 parallel cloud-to-cloud transfer streams
+MAX_WORKERS = 8           # 8 parallel cloud-to-cloud transfer streams
 MAX_ASSETS_PER_TAG = 600  # Safe limit well below GitHub's 1,000 cap
 
 KNOWN_VAULTS = {
@@ -114,7 +112,8 @@ def gh_api_request(url: str, token: str, method: str = "GET", data: Optional[byt
         req.add_header("Content-Type", content_type)
         req.data = data
 
-    for attempt in range(3):
+    max_attempts = 10
+    for attempt in range(max_attempts):
         try:
             with urllib.request.urlopen(req, timeout=60) as resp:
                 res = resp.read()
@@ -123,10 +122,24 @@ def gh_api_request(url: str, token: str, method: str = "GET", data: Optional[byt
             err_body = e.read().decode("utf-8", errors="ignore")
             if e.code == 404:
                 raise
+            
+            # Check rate limiting
+            if e.code in (403, 429):
+                reset_header = e.headers.get("x-ratelimit-reset")
+                if "rate limit" in err_body.lower() or reset_header:
+                    wait_sec = 60
+                    if reset_header:
+                        try:
+                            wait_sec = max(10, int(reset_header) - int(time.time()) + 15)
+                        except Exception:
+                            wait_sec = 60
+                    print(f"\n[⏳] GitHub API Rate Limit reached (5,000/hr quota). Pausing execution for {wait_sec}s until quota resets...")
+                    time.sleep(wait_sec)
+                    continue
+
             print(f"[!] GitHub API HTTP {e.code} on {url}: {err_body}")
-            if e.code in (403, 429) and attempt < 2:
-                print(f"[*] Rate limit or temporary auth lock. Waiting 10s before retry (attempt {attempt+1}/3)...")
-                time.sleep(10)
+            if attempt < max_attempts - 1:
+                time.sleep(5)
                 continue
             raise
 
@@ -138,7 +151,7 @@ def get_or_create_release(repo: str, token: str, tag: str, title: str) -> Dict[s
         if e.code != 404:
             raise
 
-    # Tag does not exist. First attempt: Use GitHub CLI (gh) pre-installed on GitHub Actions runner
+    # 1. First attempt: gh CLI
     print(f"[*] Creating new release for '{tag}' via GitHub CLI...")
     try:
         env = dict(os.environ)
@@ -150,12 +163,10 @@ def get_or_create_release(repo: str, token: str, tag: str, title: str) -> Dict[s
             print(f"[+] Release '{tag}' created successfully via gh CLI.")
             time.sleep(2)
             return gh_api_request(url, token, method="GET")
-        else:
-            print(f"[!] gh CLI notice: {proc.stderr.strip()}. Falling back to REST API...")
     except Exception as gh_err:
-        print(f"[!] gh CLI invocation skipped: {gh_err}")
+        print(f"[!] gh CLI notice: {gh_err}")
 
-    # Fallback attempt: GitHub REST API with explicit target_commitish
+    # 2. Fallback: REST API
     create_url = f"https://api.github.com/repos/{repo}/releases"
     payload = json.dumps({
         "tag_name": tag,
@@ -253,6 +264,17 @@ def process_vault(vid: str, vinfo: Dict[str, str], gh_repo: str, gh_token: str, 
     all_mirrored_assets = dict(base_assets)
     print(f"[*] Checked base release '{base_tag}': {len(base_assets)} files already mirrored.")
 
+    # Also check any existing shards (vault-{vid}-part02, vault-{vid}-part03, etc.)
+    p_check = 2
+    while True:
+        check_tag = f"vault-{vid}-part{p_check:02d}"
+        s_r, s_a = get_release_assets_map(gh_repo, gh_token, check_tag)
+        if not s_r or not s_a:
+            break
+        print(f"[*] Checked existing shard '{check_tag}': {len(s_a)} assets already mirrored.")
+        all_mirrored_assets.update(s_a)
+        p_check += 1
+
     # Filter unmirrored files
     unmirrored_files = [f for f in files if sanitize_asset_name(f["fileName"]) not in all_mirrored_assets]
     print(f"[*] Remaining unmirrored files for Vault {vid}: {len(unmirrored_files)} / {len(files)}")
@@ -265,7 +287,7 @@ def process_vault(vid: str, vinfo: Dict[str, str], gh_repo: str, gh_token: str, 
     if len(files) <= MAX_ASSETS_PER_TAG and (not base_rel or len(base_assets) < MAX_ASSETS_PER_TAG):
         shards = [(base_tag, unmirrored_files)]
     else:
-        start_part = 2 if base_rel else 1
+        start_part = p_check
         shards = []
         for i in range(0, len(unmirrored_files), MAX_ASSETS_PER_TAG):
             part_files = unmirrored_files[i:i + MAX_ASSETS_PER_TAG]
@@ -281,7 +303,6 @@ def process_vault(vid: str, vinfo: Dict[str, str], gh_repo: str, gh_token: str, 
         s_rel = get_or_create_release(gh_repo, gh_token, s_tag, f"Vault {vid} Mirror - {s_tag}")
         upload_url_tmpl = s_rel["upload_url"]
 
-        # Check existing assets in this shard release
         _, s_existing = get_release_assets_map(gh_repo, gh_token, s_tag)
         shard_unmirrored = [f for f in s_files if sanitize_asset_name(f["fileName"]) not in s_existing]
 
@@ -296,16 +317,16 @@ def process_vault(vid: str, vinfo: Dict[str, str], gh_repo: str, gh_token: str, 
             fname = file_item["fileName"]
             asset_name = sanitize_asset_name(fname)
 
-            for attempt in range(3):
+            for attempt in range(5):
                 try:
                     raw_bytes = b2_download_file(download_url, auth_token, b2_bucket_name, fname)
                     encrypted_bin = encrypt_payload(raw_bytes, fname, master_key_bytes)
                     dl_url = upload_release_asset(upload_url_tmpl, gh_token, asset_name, encrypted_bin)
                     return (fname, asset_name, dl_url, len(raw_bytes), "OK")
                 except Exception as e:
-                    if attempt == 2:
+                    if attempt == 4:
                         return (fname, asset_name, "", 0, f"FAIL: {e}")
-                    time.sleep(1.0)
+                    time.sleep(2.0)
             return (fname, asset_name, "", 0, "FAIL: Retries exhausted")
 
         manifest = {}
@@ -328,7 +349,6 @@ def process_vault(vid: str, vinfo: Dict[str, str], gh_repo: str, gh_token: str, 
                     errors += 1
                     print(f"[{done_count}/{total_shard_work} - {pct}%] {s_tag} [!] {status} on {fname}")
 
-        # Upload shard manifest
         try:
             m_bytes = json.dumps(manifest, indent=2).encode("utf-8")
             upload_release_asset(upload_url_tmpl, gh_token, f"manifest_{s_tag}.json", m_bytes)
