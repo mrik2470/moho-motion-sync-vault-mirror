@@ -32,6 +32,7 @@ jobs:
       - name: Run Cloud-to-Cloud Mirror Pipeline
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           MMS_MASTER_KEY: ${{ secrets.MMS_MASTER_KEY }}
           TARGET_VAULT_ID: ${{ github.event.inputs.vault_id || 'all' }}

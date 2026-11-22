@@ -1,8 +1,10 @@
 """
-Moho Motion Sync - High-Speed Multi-Threaded Sharded Cloud Mirror
+Moho Motion Sync - High-Speed Multi-Threaded Sharded Cloud Mirror (v2.1)
 Concurrently mirrors Vaults 01 to 10 into AES-256-GCM encrypted GitHub Releases.
 Features:
-- Automatic Release Sharding (Max 600 files per tag to avoid GitHub 1,000 asset limit)
+- Dual-Engine Release Creation: GitHub CLI (gh) + REST API with target_commitish: main
+- Robust error diagnostics & rate-limit backoff handling
+- Automatic Release Sharding (Max 600 files per tag)
 - 100% backward compatibility: Preserves existing 3,000 assets in vault-08, vault-01, vault-09
 - 8x parallel multi-threaded stream workers
 - Dynamic resume and deduplication
@@ -16,6 +18,7 @@ import zlib
 import struct
 import secrets
 import hashlib
+import subprocess
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -106,29 +109,63 @@ def gh_api_request(url: str, token: str, method: str = "GET", data: Optional[byt
     req.add_header("Authorization", f"Bearer {token}")
     req.add_header("Accept", "application/vnd.github+json")
     req.add_header("X-GitHub-Api-Version", "2022-11-28")
+    req.add_header("User-Agent", "MMS-Mirror-Engine/2.0")
     if data is not None:
         req.add_header("Content-Type", content_type)
         req.data = data
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        res = resp.read()
-        return json.loads(res.decode("utf-8")) if res else {}
+
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                res = resp.read()
+                return json.loads(res.decode("utf-8")) if res else {}
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8", errors="ignore")
+            if e.code == 404:
+                raise
+            print(f"[!] GitHub API HTTP {e.code} on {url}: {err_body}")
+            if e.code in (403, 429) and attempt < 2:
+                print(f"[*] Rate limit or temporary auth lock. Waiting 10s before retry (attempt {attempt+1}/3)...")
+                time.sleep(10)
+                continue
+            raise
 
 def get_or_create_release(repo: str, token: str, tag: str, title: str) -> Dict[str, Any]:
     url = f"https://api.github.com/repos/{repo}/releases/tags/{tag}"
     try:
         return gh_api_request(url, token, method="GET")
     except urllib.error.HTTPError as e:
-        if e.code == 404:
-            create_url = f"https://api.github.com/repos/{repo}/releases"
-            payload = json.dumps({
-                "tag_name": tag,
-                "name": title,
-                "body": f"Automated encrypted asset mirror for {tag}. AES-256-GCM container storage.",
-                "draft": False,
-                "prerelease": False
-            }).encode("utf-8")
-            return gh_api_request(create_url, token, method="POST", data=payload)
-        raise
+        if e.code != 404:
+            raise
+
+    # Tag does not exist. First attempt: Use GitHub CLI (gh) pre-installed on GitHub Actions runner
+    print(f"[*] Creating new release for '{tag}' via GitHub CLI...")
+    try:
+        env = dict(os.environ)
+        env["GH_TOKEN"] = token
+        env["GITHUB_TOKEN"] = token
+        cmd = ["gh", "release", "create", tag, "--target", "main", "--title", title, "--notes", f"Automated encrypted asset mirror for {tag}."]
+        proc = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        if proc.returncode == 0:
+            print(f"[+] Release '{tag}' created successfully via gh CLI.")
+            time.sleep(2)
+            return gh_api_request(url, token, method="GET")
+        else:
+            print(f"[!] gh CLI notice: {proc.stderr.strip()}. Falling back to REST API...")
+    except Exception as gh_err:
+        print(f"[!] gh CLI invocation skipped: {gh_err}")
+
+    # Fallback attempt: GitHub REST API with explicit target_commitish
+    create_url = f"https://api.github.com/repos/{repo}/releases"
+    payload = json.dumps({
+        "tag_name": tag,
+        "target_commitish": "main",
+        "name": title,
+        "body": f"Automated encrypted asset mirror for {tag}. AES-256-GCM container storage.",
+        "draft": False,
+        "prerelease": False
+    }).encode("utf-8")
+    return gh_api_request(create_url, token, method="POST", data=payload)
 
 def get_release_assets_map(repo: str, token: str, tag: str) -> Tuple[Optional[Dict[str, Any]], Dict[str, str]]:
     url = f"https://api.github.com/repos/{repo}/releases/tags/{tag}"
@@ -209,7 +246,7 @@ def process_vault(vid: str, vinfo: Dict[str, str], gh_repo: str, gh_token: str, 
         print(f"[*] Vault {vid} is empty. Skipping.")
         return
 
-    # 3. Check existing legacy base release `vault-{vid}-mirror` (if already created with 1,000 files)
+    # 3. Check existing legacy base release `vault-{vid}-mirror` (if already created with assets)
     base_tag = f"vault-{vid}-mirror"
     base_rel, base_assets = get_release_assets_map(gh_repo, gh_token, base_tag)
     
@@ -224,12 +261,10 @@ def process_vault(vid: str, vinfo: Dict[str, str], gh_repo: str, gh_token: str, 
         print(f"[+] Vault {vid} is ALREADY 100% MIRRORED! Skipping.")
         return
 
-    # 4. If <= MAX_ASSETS_PER_TAG and base release has capacity (< MAX_ASSETS_PER_TAG), upload directly to base_tag
-    # Otherwise, shard unmirrored files into parts (e.g. vault-{vid}-part02, vault-{vid}-part03...)
+    # 4. Determine Release Shards
     if len(files) <= MAX_ASSETS_PER_TAG and (not base_rel or len(base_assets) < MAX_ASSETS_PER_TAG):
         shards = [(base_tag, unmirrored_files)]
     else:
-        # Determine starting part index
         start_part = 2 if base_rel else 1
         shards = []
         for i in range(0, len(unmirrored_files), MAX_ASSETS_PER_TAG):
