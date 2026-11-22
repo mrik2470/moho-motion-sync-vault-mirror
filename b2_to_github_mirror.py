@@ -1,6 +1,6 @@
 """
-Moho Motion Sync - Multi-Vault Backblaze B2 to Encrypted GitHub Mirror
-Automatically mirrors Vault 08, 09, 10 into AES-256-GCM encrypted GitHub Releases.
+Moho Motion Sync - High-Speed Multi-Threaded B2 to Encrypted GitHub Mirror
+Concurrently mirrors Vaults 01 to 10 into AES-256-GCM encrypted GitHub Releases.
 """
 
 import os
@@ -14,7 +14,8 @@ import hashlib
 import urllib.request
 import urllib.error
 import urllib.parse
-from typing import Dict, List, Any, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Dict, List, Any, Optional, Tuple
 
 try:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -24,58 +25,19 @@ except ImportError:
 
 MAGIC_HEADER = b"MMSX"
 FORMAT_VERSION = 1
+MAX_WORKERS = 8  # 8 parallel cloud-to-cloud transfer streams
 
 KNOWN_VAULTS = {
-    "01": {
-        "bucket": "mms-secure-vault-01",
-        "key_id": "005bf0bf426cb820000000001",
-        "app_key": "K005Nzcw0sWUXgwvN2uAtX86PzNveSw"
-    },
-    "02": {
-        "bucket": "mms-secure-vault-02",
-        "key_id": "005662c67e5d84d0000000001",
-        "app_key": "K005wqZQEMLweYWFKzJ+Qx+vjaFPvHY"
-    },
-    "03": {
-        "bucket": "mms-secure-vault-03",
-        "key_id": "005868f228a70cb0000000001",
-        "app_key": "K005G0wpB9JgNxpc9sLw0FeihGUpGsU"
-    },
-    "04": {
-        "bucket": "mms-secure-vault-04",
-        "key_id": "005cba5ae79f02b0000000001",
-        "app_key": "K0059ompgIVdDg7gTjRKo4sZvQT+m4A"
-    },
-    "05": {
-        "bucket": "mms-secure-vault-05",
-        "key_id": "0053275942c61440000000001",
-        "app_key": "K005rtHbvjzOWc8mmQZrAzT4JYfoZPM"
-    },
-    "06": {
-        "bucket": "mms-secure-vault-06",
-        "key_id": "00514e0dabdf9060000000001",
-        "app_key": "K005ORdbGQU6Ih5nIyLEOP3mXiEtbOo"
-    },
-    "07": {
-        "bucket": "mms-secure-vault-07",
-        "key_id": "005668547722b400000000001",
-        "app_key": "K005Rloxwnfwew2TY03qfZHZCJpkj4I"
-    },
-    "08": {
-        "bucket": "mms-secure-vault-08",
-        "key_id": "005e967577c6b2d0000000001",
-        "app_key": "K005i6QZX53CU4XtfvL2oaD/CcwYzzE"
-    },
-    "09": {
-        "bucket": "mms-secure-vault-09",
-        "key_id": "005f3f8afaf36cb0000000001",
-        "app_key": "K005W6kTXe4glRD/H8YnHYl8gA+ISCc"
-    },
-    "10": {
-        "bucket": "mms-secure-vault-10",
-        "key_id": "0056a17e6a16c5b0000000001",
-        "app_key": "K005QdoRzRnY0hqBwjLgTmUOQAj6bHQ"
-    }
+    "01": {"bucket": "mms-secure-vault-01", "key_id": "005bf0bf426cb820000000001", "app_key": "K005Nzcw0sWUXgwvN2uAtX86PzNveSw"},
+    "02": {"bucket": "mms-secure-vault-02", "key_id": "005662c67e5d84d0000000001", "app_key": "K005wqZQEMLweYWFKzJ+Qx+vjaFPvHY"},
+    "03": {"bucket": "mms-secure-vault-03", "key_id": "005868f228a70cb0000000001", "app_key": "K005G0wpB9JgNxpc9sLw0FeihGUpGsU"},
+    "04": {"bucket": "mms-secure-vault-04", "key_id": "005cba5ae79f02b0000000001", "app_key": "K0059ompgIVdDg7gTjRKo4sZvQT+m4A"},
+    "05": {"bucket": "mms-secure-vault-05", "key_id": "0053275942c61440000000001", "app_key": "K005rtHbvjzOWc8mmQZrAzT4JYfoZPM"},
+    "06": {"bucket": "mms-secure-vault-06", "key_id": "00514e0dabdf9060000000001", "app_key": "K005ORdbGQU6Ih5nIyLEOP3mXiEtbOo"},
+    "07": {"bucket": "mms-secure-vault-07", "key_id": "005668547722b400000000001", "app_key": "K005Rloxwnfwew2TY03qfZHZCJpkj4I"},
+    "08": {"bucket": "mms-secure-vault-08", "key_id": "005e967577c6b2d0000000001", "app_key": "K005i6QZX53CU4XtfvL2oaD/CcwYzzE"},
+    "09": {"bucket": "mms-secure-vault-09", "key_id": "005f3f8afaf36cb0000000001", "app_key": "K005W6kTXe4glRD/H8YnHYl8gA+ISCc"},
+    "10": {"bucket": "mms-secure-vault-10", "key_id": "0056a17e6a16c5b0000000001", "app_key": "K005QdoRzRnY0hqBwjLgTmUOQAj6bHQ"}
 }
 
 def b2_authorize(key_id: str, app_key: str) -> Dict[str, Any]:
@@ -185,10 +147,9 @@ def process_vault(vid: str, vinfo: Dict[str, str], gh_repo: str, gh_token: str, 
     download_url = b2_auth["downloadUrl"]
     auth_token = b2_auth["authorizationToken"]
 
-    # Retrieve bucketId directly from allowed key scope
+    # Retrieve bucketId directly
     bucket_id = b2_auth.get("allowed", {}).get("bucketId")
     if not bucket_id:
-        # Fallback query list_buckets if unrestricted
         try:
             req_b = urllib.request.Request(
                 f"{api_url}/b2api/v2/b2_list_buckets",
@@ -217,47 +178,79 @@ def process_vault(vid: str, vinfo: Dict[str, str], gh_repo: str, gh_token: str, 
     release_info = get_or_create_release(gh_repo, gh_token, release_tag, f"Vault {vid} Encrypted Mirror")
     upload_url_tmpl = release_info["upload_url"]
 
-    # Check already mirrored assets
-    existing_assets = {a["name"]: a["browser_download_url"] for a in release_info.get("assets", [])}
-    print(f"[*] Already mirrored in release: {len(existing_assets)}")
+    # Check already mirrored assets (Paginated fetch up to all assets)
+    existing_assets = {}
+    rel_id = release_info["id"]
+    page = 1
+    while True:
+        p_url = f"https://api.github.com/repos/{gh_repo}/releases/{rel_id}/assets?per_page=100&page={page}"
+        try:
+            p_assets = gh_api_request(p_url, gh_token, method="GET")
+            if not p_assets:
+                break
+            for a in p_assets:
+                existing_assets[a["name"]] = a["browser_download_url"]
+            if len(p_assets) < 100:
+                break
+            page += 1
+        except Exception:
+            break
+
+    print(f"[*] Verified existing release assets already mirrored: {len(existing_assets)}")
+
+    # If all files in vault are already mirrored, finish immediately
+    unmirrored = [f for f in files if sanitize_asset_name(f["fileName"]) not in existing_assets]
+    print(f"[*] Remaining to upload for Vault {vid}: {len(unmirrored)} files (Skipping {len(files) - len(unmirrored)})")
+
+    if not unmirrored:
+        print(f"[+] Vault {vid} is already 100% mirrored! Moving to next vault.")
+        return
 
     manifest = {}
     uploaded = 0
-    skipped = 0
+    skipped = len(files) - len(unmirrored)
     errors = 0
 
-    for idx, f in enumerate(files, 1):
-        fname = f["fileName"]
+    # Parallel Worker
+    def mirror_worker(item_tuple: Tuple[int, Dict[str, Any]]) -> Tuple[str, str, str, int, str]:
+        idx, file_item = item_tuple
+        fname = file_item["fileName"]
         asset_name = sanitize_asset_name(fname)
 
-        if asset_name in existing_assets:
-            manifest[fname] = {
-                "bin_name": asset_name,
-                "download_url": existing_assets[asset_name],
-                "size": f.get("contentLength", 0)
-            }
-            skipped += 1
-            continue
+        for attempt in range(3):
+            try:
+                raw_bytes = b2_download_file(download_url, auth_token, b2_bucket_name, fname)
+                encrypted_bin = encrypt_payload(raw_bytes, fname, master_key_bytes)
+                dl_url = upload_release_asset(upload_url_tmpl, gh_token, asset_name, encrypted_bin)
+                return (fname, asset_name, dl_url, len(raw_bytes), "OK")
+            except Exception as e:
+                if attempt == 2:
+                    return (fname, asset_name, "", 0, f"FAIL: {e}")
+                time.sleep(1.0)
+        return (fname, asset_name, "", 0, "FAIL: Retries exhausted")
 
-        print(f"[{idx}/{len(files)}] Vault {vid}: {fname} -> {asset_name}...")
-        try:
-            raw_bytes = b2_download_file(download_url, auth_token, b2_bucket_name, fname)
-            encrypted_bin = encrypt_payload(raw_bytes, fname, master_key_bytes)
-            dl_url = upload_release_asset(upload_url_tmpl, gh_token, asset_name, encrypted_bin)
-            manifest[fname] = {
-                "bin_name": asset_name,
-                "download_url": dl_url,
-                "size": len(raw_bytes)
-            }
-            uploaded += 1
-            print(f"    [+] Mirrored OK: {dl_url}")
-        except Exception as e:
-            print(f"    [!] Mirror failed for {fname}: {e}")
-            errors += 1
+    # Execute with ThreadPoolExecutor
+    total_unmirrored = len(unmirrored)
+    print(f"[*] Launching {MAX_WORKERS} parallel stream workers for Vault {vid}...")
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_map = {executor.submit(mirror_worker, (i, f)): f for i, f in enumerate(unmirrored, 1)}
+        done_count = 0
+        for future in as_completed(future_map):
+            done_count += 1
+            fname, asset_name, dl_url, sz, status = future.result()
+            pct = int((done_count / total_unmirrored) * 100)
+            if status == "OK":
+                uploaded += 1
+                manifest[fname] = {"bin_name": asset_name, "download_url": dl_url, "size": sz}
+                print(f"[{done_count}/{total_unmirrored} - {pct}%] Vault {vid} [+] {fname} -> {asset_name}")
+            else:
+                errors += 1
+                print(f"[{done_count}/{total_unmirrored} - {pct}%] Vault {vid} [!] {status} on {fname}")
 
     # Upload manifest
-    manifest_bytes = json.dumps(manifest, indent=2).encode("utf-8")
     try:
+        manifest_bytes = json.dumps(manifest, indent=2).encode("utf-8")
         upload_release_asset(upload_url_tmpl, gh_token, f"vault_{vid}_mirror_manifest.json", manifest_bytes)
     except Exception:
         pass
@@ -266,7 +259,7 @@ def process_vault(vid: str, vinfo: Dict[str, str], gh_repo: str, gh_token: str, 
 
 def main():
     print("=" * 70)
-    print("   MOHO MOTION SYNC - MULTI-VAULT B2 TO GITHUB MIRROR PIPELINE   ")
+    print("   MOHO MOTION SYNC - MULTI-THREADED (8x) CLOUD MIRROR PIPELINE   ")
     print("=" * 70)
 
     gh_repo = os.environ.get("GITHUB_REPOSITORY")
@@ -283,24 +276,15 @@ def main():
         print("[!] Master key must be exactly 32 bytes (64 hex chars).")
         sys.exit(1)
 
-    # Determine which vaults to process
     if target_vault in ["all", ""]:
         vaults_to_run = list(KNOWN_VAULTS.keys())
     elif target_vault in KNOWN_VAULTS:
         vaults_to_run = [target_vault]
     else:
-        # Check if custom credentials passed via environment
-        env_b2_id = os.environ.get("B2_KEY_ID")
-        env_b2_key = os.environ.get("B2_APP_KEY")
-        env_bucket = os.environ.get("B2_BUCKET_NAME", f"mms-secure-vault-{target_vault}")
-        if env_b2_id and env_b2_key:
-            KNOWN_VAULTS[target_vault] = {"bucket": env_bucket, "key_id": env_b2_id, "app_key": env_b2_key}
-            vaults_to_run = [target_vault]
-        else:
-            print(f"[!] Unknown target vault '{target_vault}'. Available: {list(KNOWN_VAULTS.keys())} or 'all'")
-            sys.exit(1)
+        print(f"[!] Unknown target vault '{target_vault}'. Available: {list(KNOWN_VAULTS.keys())} or 'all'")
+        sys.exit(1)
 
-    print(f"[*] Repositories to mirror: {vaults_to_run}")
+    print(f"[*] Target Repositories: {vaults_to_run}")
 
     for vid in sorted(vaults_to_run):
         process_vault(vid, KNOWN_VAULTS[vid], gh_repo, gh_token, master_key_bytes)
