@@ -221,6 +221,7 @@ def get_release_assets_map(repo: str, token: str, tag: str) -> Tuple[Optional[Di
                 break
             for a in p_assets:
                 assets_map[a["name"]] = a["browser_download_url"]
+                assets_map[normalize_name(a["name"])] = a["browser_download_url"]
             if len(p_assets) < 100:
                 break
             page += 1
@@ -234,8 +235,12 @@ def upload_release_asset(upload_url_template: str, token: str, asset_name: str, 
     res = gh_api_request(upload_url, token, method="POST", data=payload_bytes, content_type="application/octet-stream")
     return res.get("browser_download_url", "")
 
+def normalize_name(s: str) -> str:
+    return s.replace("(", "").replace(")", "").replace("#", "_").replace("@", "_").replace(" ", "_")
+
 def sanitize_asset_name(remote_path: str) -> str:
     safe = remote_path.replace("/", "_").replace("\\", "_").replace(" ", "_")
+    safe = safe.replace("(", "").replace(")", "").replace("#", "_").replace("@", "_")
     return f"{safe}.bin"
 
 def build_upload_tasks(files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -339,7 +344,7 @@ def process_vault(vid: str, vinfo: Dict[str, str], gh_repo: str, gh_token: str, 
 
     # 4. Build upload tasks (with streaming chunking for large files)
     upload_tasks = build_upload_tasks(files)
-    unmirrored_tasks = [t for t in upload_tasks if t["asset_name"] not in all_mirrored_assets]
+    unmirrored_tasks = [t for t in upload_tasks if t["asset_name"] not in all_mirrored_assets and normalize_name(t["asset_name"]) not in all_mirrored_assets]
     print(f"[*] Total upload tasks for Vault {vid}: {len(upload_tasks)} | Remaining unmirrored: {len(unmirrored_tasks)}")
 
     if not unmirrored_tasks:
@@ -367,7 +372,7 @@ def process_vault(vid: str, vinfo: Dict[str, str], gh_repo: str, gh_token: str, 
         upload_url_tmpl = s_rel["upload_url"]
 
         _, s_existing = get_release_assets_map(gh_repo, gh_token, s_tag)
-        shard_unmirrored = [t for t in s_tasks if t["asset_name"] not in s_existing]
+        shard_unmirrored = [t for t in s_tasks if t["asset_name"] not in s_existing and normalize_name(t["asset_name"]) not in s_existing]
 
         if not shard_unmirrored:
             print(f"     [+] Shard {s_tag} already 100% uploaded. Skipping.")
