@@ -1,38 +1,46 @@
 """
-Moho Motion Sync - High-Speed Multi-Threaded Sharded Cloud Mirror (v2.2)
+Moho Motion Sync - High-Speed Multi-Threaded Sharded Cloud Mirror (v2.3)
+Concurrently mirrors Vaults 01 to 10 into AES-256-GCM encrypted GitHub Releases.
+
 Features:
+- Smart Streaming Chunker: Automatically slices large pack files (>800MB, e.g. 7GB packs) into 400MB slices.
+  Uses HTTP 206 Range requests from B2 to prevent RAM exhaustion and bypass GitHub's 2GB release limit.
 - Smart Rate-Limit Auto-Sleep: When GitHub's 5,000 requests/hr quota is reached, pauses and auto-resumes after reset.
-- Automatic Release Sharding (Max 600 files per tag)
-- 100% backward compatibility: Preserves existing ~8,000 assets
-- 8x parallel multi-threaded stream workers
-- Dynamic resume and deduplication
+- Automatic Release Sharding (Max 600 files per tag).
+- 100% backward compatibility: Preserves and skips existing ~38,000 assets in Vaults 01, 08, 09.
+- Dynamic resume and deduplication at both vault and shard level.
 """
 
 import os
 import sys
 import time
-import json
 import zlib
+import json
+import math
 import struct
-import secrets
 import hashlib
-import subprocess
+import secrets
 import urllib.request
 import urllib.error
 import urllib.parse
+import subprocess
+from pathlib import Path
+from typing import Dict, Any, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Any, Optional, Tuple
 
 try:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 except ImportError:
-    print("[!] Error: 'cryptography' is required. Run: pip install cryptography")
+    print("[!] Error: 'cryptography' library is required. Run: pip install cryptography")
     sys.exit(1)
 
 MAGIC_HEADER = b"MMSX"
 FORMAT_VERSION = 1
-MAX_WORKERS = 8           # 8 parallel cloud-to-cloud transfer streams
+MAX_WORKERS_DEFAULT = 8   # 8 parallel streams for normal files
+MAX_WORKERS_CHUNKS = 3    # 3 parallel streams for large chunk slices to maintain low RAM (<1.5 GB)
 MAX_ASSETS_PER_TAG = 600  # Safe limit well below GitHub's 1,000 cap
+CHUNK_THRESHOLD = 800 * 1024 * 1024  # 800 MB: files larger than this are split
+CHUNK_SIZE = 400 * 1024 * 1024       # 400 MB slices
 
 KNOWN_VAULTS = {
     "01": {"bucket": "mms-secure-vault-01", "key_id": "005bf0bf426cb820000000001", "app_key": "K005Nzcw0sWUXgwvN2uAtX86PzNveSw"},
@@ -82,10 +90,20 @@ def b2_download_file(download_url: str, auth_token: str, bucket_name: str, file_
     encoded_name = "/".join(urllib.parse.quote(part) for part in file_name.split("/"))
     url = f"{download_url}/file/{bucket_name}/{encoded_name}"
     req = urllib.request.Request(url, headers={"Authorization": auth_token})
-    with urllib.request.urlopen(req, timeout=120) as resp:
+    with urllib.request.urlopen(req, timeout=300) as resp:
         return resp.read()
 
-def encrypt_payload(raw_bytes: bytes, rel_path: str, master_key_bytes: bytes) -> bytes:
+def b2_download_file_range(download_url: str, auth_token: str, bucket_name: str, file_name: str, start_byte: int, end_byte: int) -> bytes:
+    encoded_name = "/".join(urllib.parse.quote(part) for part in file_name.split("/"))
+    url = f"{download_url}/file/{bucket_name}/{encoded_name}"
+    req = urllib.request.Request(url, headers={
+        "Authorization": auth_token,
+        "Range": f"bytes={start_byte}-{end_byte}"
+    })
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        return resp.read()
+
+def encrypt_payload(raw_bytes: bytes, rel_path: str, master_key_bytes: bytes, chunk_meta: Optional[Dict[str, Any]] = None) -> bytes:
     sha256_hash = hashlib.sha256(raw_bytes).hexdigest()
     meta = {
         "rel_path": rel_path,
@@ -93,9 +111,14 @@ def encrypt_payload(raw_bytes: bytes, rel_path: str, master_key_bytes: bytes) ->
         "sha256": sha256_hash,
         "timestamp": int(time.time())
     }
+    if chunk_meta:
+        meta.update(chunk_meta)
     meta_json = json.dumps(meta).encode("utf-8")
     inner_block = struct.pack(">I", len(meta_json)) + meta_json + raw_bytes
-    compressed = zlib.compress(inner_block, level=6)
+    
+    # Use level 4 compression on large chunks for speed and CPU efficiency
+    comp_level = 4 if len(raw_bytes) > 50 * 1024 * 1024 else 6
+    compressed = zlib.compress(inner_block, level=comp_level)
 
     nonce = secrets.token_bytes(12)
     aesgcm = AESGCM(master_key_bytes)
@@ -107,7 +130,7 @@ def gh_api_request(url: str, token: str, method: str = "GET", data: Optional[byt
     req.add_header("Authorization", f"Bearer {token}")
     req.add_header("Accept", "application/vnd.github+json")
     req.add_header("X-GitHub-Api-Version", "2022-11-28")
-    req.add_header("User-Agent", "MMS-Mirror-Engine/2.0")
+    req.add_header("User-Agent", "MMS-Mirror-Engine/2.3")
     if data is not None:
         req.add_header("Content-Type", content_type)
         req.data = data
@@ -115,7 +138,7 @@ def gh_api_request(url: str, token: str, method: str = "GET", data: Optional[byt
     max_attempts = 10
     for attempt in range(max_attempts):
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
+            with urllib.request.urlopen(req, timeout=300) as resp:
                 res = resp.read()
                 return json.loads(res.decode("utf-8")) if res else {}
         except urllib.error.HTTPError as e:
@@ -215,6 +238,45 @@ def sanitize_asset_name(remote_path: str) -> str:
     safe = remote_path.replace("/", "_").replace("\\", "_").replace(" ", "_")
     return f"{safe}.bin"
 
+def build_upload_tasks(files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Expands file list into granular upload tasks.
+    Files <= 800MB -> Single task.
+    Files > 800MB  -> Multiple 400MB streaming chunk tasks.
+    """
+    tasks = []
+    for f in files:
+        fname = f["fileName"]
+        fsize = f.get("contentLength", 0)
+        base_asset = sanitize_asset_name(fname)
+
+        if fsize <= CHUNK_THRESHOLD:
+            tasks.append({
+                "type": "single",
+                "fileName": fname,
+                "asset_name": base_asset,
+                "size": fsize
+            })
+        else:
+            total_parts = math.ceil(fsize / CHUNK_SIZE)
+            print(f"[*] Large file detected: {fname} ({fsize / (1024*1024):.1f} MB) -> Splitting into {total_parts} streaming chunks.")
+            for p_idx in range(1, total_parts + 1):
+                start_b = (p_idx - 1) * CHUNK_SIZE
+                end_b = min(p_idx * CHUNK_SIZE - 1, fsize - 1)
+                chunk_asset = f"{base_asset}.part{p_idx:02d}of{total_parts:02d}.bin"
+                tasks.append({
+                    "type": "chunk",
+                    "fileName": fname,
+                    "asset_name": chunk_asset,
+                    "part_index": p_idx,
+                    "total_parts": total_parts,
+                    "start_byte": start_b,
+                    "end_byte": end_b,
+                    "part_size": end_b - start_b + 1,
+                    "total_file_size": fsize
+                })
+    return tasks
+
 def process_vault(vid: str, vinfo: Dict[str, str], gh_repo: str, gh_token: str, master_key_bytes: bytes):
     b2_bucket_name = vinfo["bucket"]
     print("\n" + "=" * 70)
@@ -257,14 +319,14 @@ def process_vault(vid: str, vinfo: Dict[str, str], gh_repo: str, gh_token: str, 
         print(f"[*] Vault {vid} is empty. Skipping.")
         return
 
-    # 3. Check existing legacy base release `vault-{vid}-mirror` (if already created with assets)
+    # 3. Check existing legacy base release `vault-{vid}-mirror`
     base_tag = f"vault-{vid}-mirror"
     base_rel, base_assets = get_release_assets_map(gh_repo, gh_token, base_tag)
     
     all_mirrored_assets = dict(base_assets)
     print(f"[*] Checked base release '{base_tag}': {len(base_assets)} files already mirrored.")
 
-    # Also check any existing shards (vault-{vid}-part02, vault-{vid}-part03, etc.)
+    # Also check any existing shards (vault-{vid}-part02, part03, etc.)
     p_check = 2
     while True:
         check_tag = f"vault-{vid}-part{p_check:02d}"
@@ -275,58 +337,84 @@ def process_vault(vid: str, vinfo: Dict[str, str], gh_repo: str, gh_token: str, 
         all_mirrored_assets.update(s_a)
         p_check += 1
 
-    # Filter unmirrored files
-    unmirrored_files = [f for f in files if sanitize_asset_name(f["fileName"]) not in all_mirrored_assets]
-    print(f"[*] Remaining unmirrored files for Vault {vid}: {len(unmirrored_files)} / {len(files)}")
+    # 4. Build upload tasks (with streaming chunking for large files)
+    upload_tasks = build_upload_tasks(files)
+    unmirrored_tasks = [t for t in upload_tasks if t["asset_name"] not in all_mirrored_assets]
+    print(f"[*] Total upload tasks for Vault {vid}: {len(upload_tasks)} | Remaining unmirrored: {len(unmirrored_tasks)}")
 
-    if not unmirrored_files:
+    if not unmirrored_tasks:
         print(f"[+] Vault {vid} is ALREADY 100% MIRRORED! Skipping.")
         return
 
-    # 4. Determine Release Shards
-    if len(files) <= MAX_ASSETS_PER_TAG and (not base_rel or len(base_assets) < MAX_ASSETS_PER_TAG):
-        shards = [(base_tag, unmirrored_files)]
+    # 5. Determine Release Shards
+    if len(upload_tasks) <= MAX_ASSETS_PER_TAG and (not base_rel or len(base_assets) < MAX_ASSETS_PER_TAG):
+        shards = [(base_tag, unmirrored_tasks)]
     else:
         start_part = p_check
         shards = []
-        for i in range(0, len(unmirrored_files), MAX_ASSETS_PER_TAG):
-            part_files = unmirrored_files[i:i + MAX_ASSETS_PER_TAG]
+        for i in range(0, len(unmirrored_tasks), MAX_ASSETS_PER_TAG):
+            part_tasks = unmirrored_tasks[i:i + MAX_ASSETS_PER_TAG]
             part_num = start_part + len(shards)
             part_tag = f"vault-{vid}-part{part_num:02d}"
-            shards.append((part_tag, part_files))
+            shards.append((part_tag, part_tasks))
 
-    print(f"[*] Sliced remaining files into {len(shards)} release shard(s).")
+    print(f"[*] Sliced remaining tasks into {len(shards)} release shard(s).")
 
-    # 5. Process each shard
-    for s_tag, s_files in shards:
-        print(f"\n---> Shard: {s_tag} ({len(s_files)} files)")
+    # 6. Process each shard
+    for s_tag, s_tasks in shards:
+        print(f"\n---> Shard: {s_tag} ({len(s_tasks)} tasks)")
         s_rel = get_or_create_release(gh_repo, gh_token, s_tag, f"Vault {vid} Mirror - {s_tag}")
         upload_url_tmpl = s_rel["upload_url"]
 
         _, s_existing = get_release_assets_map(gh_repo, gh_token, s_tag)
-        shard_unmirrored = [f for f in s_files if sanitize_asset_name(f["fileName"]) not in s_existing]
+        shard_unmirrored = [t for t in s_tasks if t["asset_name"] not in s_existing]
 
         if not shard_unmirrored:
             print(f"     [+] Shard {s_tag} already 100% uploaded. Skipping.")
             continue
 
-        print(f"     [*] Uploading {len(shard_unmirrored)} files to {s_tag} with {MAX_WORKERS} workers...")
+        # Adjust worker concurrency: if chunk slices exist in shard, limit workers to 3 for low RAM usage
+        has_chunks = any(t["type"] == "chunk" for t in shard_unmirrored)
+        workers = MAX_WORKERS_CHUNKS if has_chunks else MAX_WORKERS_DEFAULT
 
-        def shard_worker(item_tuple: Tuple[int, Dict[str, Any]]) -> Tuple[str, str, str, int, str]:
-            idx, file_item = item_tuple
-            fname = file_item["fileName"]
-            asset_name = sanitize_asset_name(fname)
+        print(f"     [*] Uploading {len(shard_unmirrored)} tasks to {s_tag} with {workers} workers (Chunk mode: {has_chunks})...")
+
+        def task_worker(task_item: Dict[str, Any]) -> Tuple[str, str, str, int, str]:
+            fname = task_item["fileName"]
+            asset_name = task_item["asset_name"]
+            ttype = task_item["type"]
 
             for attempt in range(5):
                 try:
-                    raw_bytes = b2_download_file(download_url, auth_token, b2_bucket_name, fname)
-                    encrypted_bin = encrypt_payload(raw_bytes, fname, master_key_bytes)
+                    if ttype == "single":
+                        raw_bytes = b2_download_file(download_url, auth_token, b2_bucket_name, fname)
+                        encrypted_bin = encrypt_payload(raw_bytes, fname, master_key_bytes)
+                    else:
+                        # Stream range for chunk
+                        raw_bytes = b2_download_file_range(
+                            download_url, auth_token, b2_bucket_name, fname,
+                            task_item["start_byte"], task_item["end_byte"]
+                        )
+                        chunk_meta = {
+                            "chunked": True,
+                            "part_index": task_item["part_index"],
+                            "total_parts": task_item["total_parts"],
+                            "start_byte": task_item["start_byte"],
+                            "end_byte": task_item["end_byte"],
+                            "total_file_size": task_item["total_file_size"],
+                            "orig_rel_path": fname
+                        }
+                        encrypted_bin = encrypt_payload(
+                            raw_bytes, f"{fname}__part{task_item['part_index']:02d}",
+                            master_key_bytes, chunk_meta
+                        )
+
                     dl_url = upload_release_asset(upload_url_tmpl, gh_token, asset_name, encrypted_bin)
                     return (fname, asset_name, dl_url, len(raw_bytes), "OK")
                 except Exception as e:
                     if attempt == 4:
                         return (fname, asset_name, "", 0, f"FAIL: {e}")
-                    time.sleep(2.0)
+                    time.sleep(3.0)
             return (fname, asset_name, "", 0, "FAIL: Retries exhausted")
 
         manifest = {}
@@ -334,8 +422,8 @@ def process_vault(vid: str, vinfo: Dict[str, str], gh_repo: str, gh_token: str, 
         errors = 0
         total_shard_work = len(shard_unmirrored)
 
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            future_map = {executor.submit(shard_worker, (i, f)): f for i, f in enumerate(shard_unmirrored, 1)}
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_map = {executor.submit(task_worker, t): t for t in shard_unmirrored}
             done_count = 0
             for future in as_completed(future_map):
                 done_count += 1
@@ -343,11 +431,11 @@ def process_vault(vid: str, vinfo: Dict[str, str], gh_repo: str, gh_token: str, 
                 pct = int((done_count / total_shard_work) * 100)
                 if status == "OK":
                     uploaded += 1
-                    manifest[fname] = {"bin_name": asset_name, "download_url": dl_url, "size": sz}
-                    print(f"[{done_count}/{total_shard_work} - {pct}%] {s_tag} [+] {fname} -> {asset_name}")
+                    manifest[asset_name] = {"file": fname, "download_url": dl_url, "size": sz}
+                    print(f"[{done_count}/{total_shard_work} - {pct}%] {s_tag} [+] {fname} -> {asset_name} ({sz / (1024*1024):.1f} MB)")
                 else:
                     errors += 1
-                    print(f"[{done_count}/{total_shard_work} - {pct}%] {s_tag} [!] {status} on {fname}")
+                    print(f"[{done_count}/{total_shard_work} - {pct}%] {s_tag} [!] {status} on {asset_name}")
 
         try:
             m_bytes = json.dumps(manifest, indent=2).encode("utf-8")
@@ -361,7 +449,7 @@ def process_vault(vid: str, vinfo: Dict[str, str], gh_repo: str, gh_token: str, 
 
 def main():
     print("=" * 70)
-    print("   MOHO MOTION SYNC - SHARDED MULTI-THREADED (8x) CLOUD MIRROR   ")
+    print("   MOHO MOTION SYNC - SHARDED STREAMING CLOUD MIRROR (v2.3)   ")
     print("=" * 70)
 
     gh_repo = os.environ.get("GITHUB_REPOSITORY")

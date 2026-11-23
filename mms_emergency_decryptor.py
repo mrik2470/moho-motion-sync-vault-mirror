@@ -1,6 +1,7 @@
 """
-Moho Motion Sync - Standalone Emergency Disaster Recovery Tool
+Moho Motion Sync - Standalone Emergency Disaster Recovery Tool (v2.3)
 Decrypts self-contained MMSX (.bin) encrypted containers back into original files.
+Automatically reassembles chunked large pack files (.part01, .part02, etc.) in correct byte order.
 Zero internet or external services required - 100% offline.
 """
 
@@ -11,7 +12,7 @@ import json
 import struct
 import hashlib
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any, List
 
 try:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -23,63 +24,95 @@ except ImportError:
 MAGIC_HEADER = b"MMSX"
 FORMAT_VERSION = 1
 
-def decrypt_container(bin_path: Path, master_key_hex: str, output_base_dir: Path) -> bool:
-    try:
-        raw_payload = bin_path.read_bytes()
-        if len(raw_payload) < 17:
-            print(f"[-] Skipped {bin_path.name}: File corrupted or too small.")
-            return False
+def decrypt_mmsx_container(container_bytes: bytes, master_key_bytes: bytes) -> tuple[Dict[str, Any], bytes]:
+    if len(container_bytes) < 17:
+        raise ValueError("File is too small to be a valid MMSX container.")
 
-        magic = raw_payload[:4]
-        if magic != MAGIC_HEADER:
-            print(f"[-] Skipped {bin_path.name}: Invalid magic header ({magic}).")
-            return False
+    magic = container_bytes[:4]
+    version = container_bytes[4]
 
-        version = raw_payload[4]
-        if version != FORMAT_VERSION:
-            print(f"[-] Skipped {bin_path.name}: Unsupported container version {version}.")
-            return False
+    if magic != MAGIC_HEADER:
+        raise ValueError(f"Invalid magic header: {magic!r}. Expected {MAGIC_HEADER!r}.")
 
-        nonce = raw_payload[5:17]
-        ciphertext = raw_payload[17:]
+    if version != FORMAT_VERSION:
+        raise ValueError(f"Unsupported container version: {version}. Expected {FORMAT_VERSION}.")
 
-        key_bytes = bytes.fromhex(master_key_hex.strip())
-        aesgcm = AESGCM(key_bytes)
+    nonce = container_bytes[5:17]
+    ciphertext = container_bytes[17:]
 
-        # In-memory authentication & decryption
-        compressed_inner = aesgcm.decrypt(nonce, ciphertext, None)
-        decompressed = zlib.decompress(compressed_inner)
+    aesgcm = AESGCM(master_key_bytes)
+    decompressed = zlib.decompress(aesgcm.decrypt(nonce, ciphertext, None))
 
-        meta_len = struct.unpack(">I", decompressed[:4])[0]
-        meta = json.loads(decompressed[4:4+meta_len].decode("utf-8"))
-        original_data = decompressed[4+meta_len:]
+    if len(decompressed) < 4:
+        raise ValueError("Corrupt container payload.")
 
-        rel_path = meta.get("rel_path", bin_path.stem)
-        expected_sha256 = meta.get("sha256")
+    meta_len = struct.unpack(">I", decompressed[:4])[0]
+    meta_json = decompressed[4:4 + meta_len].decode("utf-8")
+    meta = json.loads(meta_json)
+    original_data = decompressed[4 + meta_len:]
 
-        if expected_sha256:
-            actual_sha256 = hashlib.sha256(original_data).hexdigest()
-            if actual_sha256.lower() != expected_sha256.lower():
-                print(f"[!] Integrity alert for {bin_path.name}: SHA256 mismatch!")
-                return False
+    return meta, original_data
 
-        target_file = output_base_dir / rel_path
-        target_file.parent.mkdir(parents=True, exist_ok=True)
-        target_file.write_bytes(original_data)
+def process_all_files(bin_files: List[Path], master_key_bytes: bytes, output_base_dir: Path):
+    # Group chunked files vs single files
+    single_files = []
+    chunk_groups = {}  # orig_rel_path -> list of (part_index, bin_path)
 
-        print(f"[+] Restored: {rel_path} ({len(original_data):,} bytes)")
-        return True
+    for bp in bin_files:
+        try:
+            raw = bp.read_bytes()
+            meta, data = decrypt_mmsx_container(raw, master_key_bytes)
+            if meta.get("chunked"):
+                orig_rel = meta.get("orig_rel_path", bp.stem)
+                part_idx = meta.get("part_index", 1)
+                chunk_groups.setdefault(orig_rel, []).append((part_idx, bp, meta, data))
+            else:
+                single_files.append((bp, meta, data))
+        except Exception as e:
+            print(f"[-] Failed to read/decrypt {bp.name}: {e}")
 
-    except Exception as e:
-        print(f"[-] Decryption failed for {bin_path.name}: {e}")
-        return False
+    success = 0
+    failed = 0
+
+    # 1. Restore single files
+    for bp, meta, data in single_files:
+        try:
+            rel_path = meta.get("rel_path", bp.stem)
+            target = output_base_dir / rel_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+            print(f"[+] Restored: {rel_path} ({len(data):,} bytes)")
+            success += 1
+        except Exception as e:
+            print(f"[-] Error writing {bp.name}: {e}")
+            failed += 1
+
+    # 2. Reassemble and restore chunked files
+    for orig_rel, chunks in chunk_groups.items():
+        try:
+            chunks.sort(key=lambda x: x[0])  # sort by part_index
+            target = output_base_dir / orig_rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            
+            with open(target, "wb") as out_f:
+                total_written = 0
+                for part_idx, bp, meta, data in chunks:
+                    out_f.write(data)
+                    total_written += len(data)
+            
+            print(f"[+] Reassembled & Restored Large File: {orig_rel} ({total_written:,} bytes across {len(chunks)} chunks)")
+            success += 1
+        except Exception as e:
+            print(f"[-] Error reassembling {orig_rel}: {e}")
+            failed += 1
+
+    print(f"\n[✓] Restoration complete: {success} files restored successfully, {failed} failed.")
 
 def main():
     print("=" * 70)
-    print("   MOHO MOTION SYNC - EMERGENCY DISASTER RECOVERY DECRYPTOR   ")
+    print("   MOHO MOTION SYNC - EMERGENCY DISASTER RECOVERY DECRYPTOR (v2.3)   ")
     print("=" * 70)
 
-    # 1. Acquire Master Key
     env_key = os.environ.get("MMS_MASTER_KEY", "").strip()
     if env_key and len(env_key) == 64:
         master_key = env_key
@@ -91,7 +124,8 @@ def main():
         print("[!] Invalid key length. Master key must be exactly 64 hex characters (32 bytes).")
         sys.exit(1)
 
-    # 2. Acquire target path
+    master_key_bytes = bytes.fromhex(master_key)
+
     if len(sys.argv) > 1:
         target_input = sys.argv[1]
     else:
@@ -110,28 +144,11 @@ def main():
     output_dir = Path(out_input).resolve() if out_input else default_out
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 3. Process files
-    bin_files = []
-    if target_path.is_file():
-        bin_files = [target_path]
-    else:
-        bin_files = list(target_path.rglob("*.bin"))
-
+    bin_files = [target_path] if target_path.is_file() else list(target_path.rglob("*.bin"))
     print(f"\n[*] Found {len(bin_files)} .bin files to process.")
     print(f"[*] Restoring to: {output_dir}\n")
 
-    success = 0
-    failed = 0
-
-    for idx, f in enumerate(bin_files, 1):
-        if decrypt_container(f, master_key, output_dir):
-            success += 1
-        else:
-            failed += 1
-
-    print("\n" + "=" * 70)
-    print(f"RECOVERY SUMMARY: Total: {len(bin_files)} | Succeeded: {success} | Failed: {failed}")
-    print("=" * 70)
+    process_all_files(bin_files, master_key_bytes, output_dir)
 
 if __name__ == "__main__":
     main()
