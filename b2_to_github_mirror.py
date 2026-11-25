@@ -65,11 +65,13 @@ def b2_authorize(key_id: str, app_key: str) -> Dict[str, Any]:
     with urllib.request.urlopen(req, timeout=30) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
-def b2_list_all_files(api_url: str, auth_token: str, bucket_id: str) -> List[Dict[str, Any]]:
+def b2_list_all_files(api_url: str, auth_token: str, bucket_id: str, prefix: Optional[str] = None) -> List[Dict[str, Any]]:
     files = []
     start_filename = None
     while True:
         payload = {"bucketId": bucket_id, "maxFileCount": 1000}
+        if prefix:
+            payload["prefix"] = prefix
         if start_filename:
             payload["startFileName"] = start_filename
         req = urllib.request.Request(
@@ -315,10 +317,19 @@ def process_vault(vid: str, vinfo: Dict[str, str], gh_repo: str, gh_token: str, 
         print(f"[!] Could not determine bucketId for {b2_bucket_name}. Skipping vault.")
         return
 
-    # 2. List all files from B2
-    print(f"[*] Scanning all files in Vault {vid}...")
-    files = b2_list_all_files(api_url, auth_token, bucket_id)
-    print(f"[+] Total files discovered in Vault {vid}: {len(files)}")
+    # 2. List files from B2 (Pack Architecture for Vault 07 and 10 to prevent rate-limit bottlenecks)
+    print(f"[*] Scanning files in Vault {vid}...")
+    if vid == "07":
+        print(f"[*] Vault 07 Pack Architecture: scanning 'packs/' only (skipping 115k loose duplicate files)...")
+        files = b2_list_all_files(api_url, auth_token, bucket_id, prefix="packs/")
+    elif vid == "10":
+        print(f"[*] Vault 10 Pack Architecture: scanning 'bundles/', 'clients/', and 'packs/'...")
+        files = b2_list_all_files(api_url, auth_token, bucket_id, prefix="bundles/")
+        files.extend(b2_list_all_files(api_url, auth_token, bucket_id, prefix="clients/"))
+        files.extend(b2_list_all_files(api_url, auth_token, bucket_id, prefix="packs/"))
+    else:
+        files = b2_list_all_files(api_url, auth_token, bucket_id)
+    print(f"[+] Total files targeted in Vault {vid}: {len(files)}")
 
     if not files:
         print(f"[*] Vault {vid} is empty. Skipping.")
@@ -331,16 +342,17 @@ def process_vault(vid: str, vinfo: Dict[str, str], gh_repo: str, gh_token: str, 
     all_mirrored_assets = dict(base_assets)
     print(f"[*] Checked base release '{base_tag}': {len(base_assets)} files already mirrored.")
 
-    # Also check any existing shards (vault-{vid}-part02, part03, etc.)
+    # Also check any existing shards for legacy vaults (skip for Vault 07 and 10 to keep releases clean)
     p_check = 2
-    while True:
-        check_tag = f"vault-{vid}-part{p_check:02d}"
-        s_r, s_a = get_release_assets_map(gh_repo, gh_token, check_tag)
-        if not s_r or not s_a:
-            break
-        print(f"[*] Checked existing shard '{check_tag}': {len(s_a)} assets already mirrored.")
-        all_mirrored_assets.update(s_a)
-        p_check += 1
+    if vid not in ("07", "10"):
+        while True:
+            check_tag = f"vault-{vid}-part{p_check:02d}"
+            s_r, s_a = get_release_assets_map(gh_repo, gh_token, check_tag)
+            if not s_r or not s_a:
+                break
+            print(f"[*] Checked existing shard '{check_tag}': {len(s_a)} assets already mirrored.")
+            all_mirrored_assets.update(s_a)
+            p_check += 1
 
     # 4. Build upload tasks (with streaming chunking for large files)
     upload_tasks = build_upload_tasks(files)
